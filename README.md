@@ -1,5 +1,7 @@
 # oido streaming GPU engine (Pi 400)
 
+**Reference code, not a standalone install.** These are copies of the scripts the author runs for live dictation. They expect the folder layout of the author's Pi (`~/oido/port/`, `~/voice-chat/live-mic-stream/`) and need the GPU runner, shaders and model weights from [gpu-port-kit](https://github.com/tarelerulz/gpu-port-kit) and [oido](https://github.com/tarelerulz/oido), which are not included here. Read them to see how the streaming path is built; the story of the GPU work is in [OIDO_GPU_STORY.md](https://github.com/tarelerulz/gpu-port-kit/blob/main/OIDO_GPU_STORY.md).
+
 Copies of the live streaming dictation code. The running copies are:
 - stream_ref.py, stream_gpu.py, stream_gpu2.py, stream_incr.py: ~/oido/port/
 - oido-type.py: ~/voice-chat/live-mic-stream/
