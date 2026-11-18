@@ -162,6 +162,12 @@ class OidoCLI:
         spec = importlib.util.spec_from_file_location("oido_punct", str(OIDO_PUNCT))
         self.punct_mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.punct_mod)
+        # 2026-11-10: start the keep-loaded punctuation server at engine start, so it has loaded before the first phrase
+        try:
+            if not os.path.exists(self.punct_mod.SOCK):
+                self.punct_mod.start_server(self.punct_mod.MODEL)
+        except Exception:
+            pass
         self.punctuator = None
         # keep-loaded speech server (~/bin/oido-speech-keep.py): model stays in memory between phrases
         spec2 = importlib.util.spec_from_file_location("oido_speech_keep", str(OIDO_SPEECH_KEEP))
@@ -226,6 +232,12 @@ class OidoCLI:
         except OSError:
             if self.punctuator is None:
                 self.punctuator = self.punct_mod.make_punctuator()
+                # 2026-11-10: nothing else starts the keep-loaded server on this path, so every new dictation paid the
+                # ~4 s model load on its first phrase. Start it now (detached) so the next session finds it ready.
+                try:
+                    self.punct_mod.start_server(self.punct_mod.MODEL)
+                except Exception:
+                    pass
             return self.punct_mod.punctuate(self.punctuator, text)
 
 

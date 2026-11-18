@@ -72,7 +72,10 @@ def chunk_ops(L, P, lay, n, t0, kbase, nk, kofs):
         ew('ln', n, [n, d, X, HB, lw['n_att'], lw['n_att'] + d])
         gemm(HB, n, lw['qkv'], QKV)
         ew('split_qkv', n * 3 * d, [n, d, QKV, Q, lb['KC'], lb['VC'], kofs], local=64)
-        ops.append(('ch_scores', 64, max(24, (H * n * nk + 63) // 64), 1,
+        # Four keys per invocation and vec4 head loads; lanes share key rows.
+        scores4 = dh % 4 == 0 and os.environ.get('OIDO_STREAM_SCORES4', '1') != '0'
+        score_items = H * n * ((nk + 3) // 4 if scores4 else nk)
+        ops.append(('ch_scores4jf' if scores4 else 'ch_scores', 64, max(24, (score_items + 63) // 64), 1,
                     [n, nk, H, dh, d, Q, lb['KC'], lb['P'], SC, lw['pbu'], lw['pbv'], t0, kbase, OMAX, NP] + [0] * 17))
         ew('ch_softmax', H * n, [n, nk, H, dh, d, Q, lb['KC'], lb['P'], SC, lw['pbu'], lw['pbv'], 0] + [0] * 20)
         ops.append(('ch_pv', 64, max(24, (H * n * (dh // 4) + 63) // 64), 1,
