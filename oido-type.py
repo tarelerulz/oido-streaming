@@ -173,7 +173,7 @@ class HybridTail:
             log(f"hybrid: CPU engine failed to start, GPU only: {e}")
 
     # 2026-11-20 recalibrated cut rule (after 4x4 NEON CPU ~1.7x speedup + GPU plan cache / C argmax):
-    # GPU cost is a staircase at 64-frame (2.56 s) blocks; fast 3-core CPU tail is ~34 ms/s + 8 ms.
+    # GPU cost is a staircase at 64-frame (2.56 s) blocks; fast 3-core CPU tail (exact build, varying T) is ~32.5 ms/s + 1 ms, modeled as 33 ms/s + 4 ms.
     # Conservative quiet-pause threshold RATIO=0.05 kept; window widened to 28-70% to hit the new ~35% balance point.
     RATIO = float(os.environ.get("OIDO_HYBRID_RATIO", "0.05"))
     LO = float(os.environ.get("OIDO_HYBRID_LO", "0.28"))
@@ -195,7 +195,7 @@ class HybridTail:
             if (c[s0 + w] - c[s0]) / w > thr:
                 continue
             cut = s0 + w // 2
-            t = max(1.09 * gpu_ms(cut / RATE), 34.0 * (n - cut) / RATE + 8.0) + 10.0
+            t = max(1.09 * gpu_ms(cut / RATE), 33.0 * (n - cut) / RATE + 4.0) + 10.0
             if best is None or t < best[0]:
                 best = (t, cut)
         if best is None or best[0] > 0.9 * gpu_ms(n / RATE):
