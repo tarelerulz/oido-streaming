@@ -172,11 +172,13 @@ class HybridTail:
             self.dead = True
             log(f"hybrid: CPU engine failed to start, GPU only: {e}")
 
-    # 2026-11-19 cut rule (~/doc/benchmarks/hybrid-chunk-split-2026-11-19/cutrule.py, tested on 65 real clips): only cut at a real pause
-    # (100 ms energy <= RATIO x the phrase's speech level), pick the pause that balances GPU head and CPU tail by estimated time,
-    # skip the split when the estimated gain is under 10 %.
+    # 2026-11-20 recalibrated cut rule (after 4x4 NEON CPU ~1.7x speedup + GPU plan cache / C argmax):
+    # GPU cost is a staircase at 64-frame (2.56 s) blocks; fast 3-core CPU tail is ~34 ms/s + 8 ms.
+    # Conservative quiet-pause threshold RATIO=0.05 kept; window widened to 28-70% to hit the new ~35% balance point.
     RATIO = float(os.environ.get("OIDO_HYBRID_RATIO", "0.05"))
-    GPU_PTS = [(0, 60), (1.5, 125), (2.4, 148), (3.1, 204), (3.7, 228), (4.5, 250), (5.8, 348), (7.0, 387), (9.4, 476), (10, 488), (15, 817), (19, 1127)]
+    LO = float(os.environ.get("OIDO_HYBRID_LO", "0.28"))
+    HI = float(os.environ.get("OIDO_HYBRID_HI", "0.70"))
+    GPU_PTS = [(0, 95), (2.56, 128), (2.57, 180), (5.12, 238), (5.13, 295), (7.68, 385), (7.69, 420), (10.24, 460), (10.25, 535), (15, 775), (19, 1080)]
 
     def split(self, pcm):
         """Cut index (samples) or None."""
@@ -189,11 +191,11 @@ class HybridTail:
         st = np.arange(0, n - w, 160); e_all = (c[st + w] - c[st]) / w
         thr = max(30.0, self.RATIO * float(np.percentile(e_all, 70)))
         best = None
-        for s0 in range(int(0.35 * n), int(0.75 * n), 160):
+        for s0 in range(int(self.LO * n), int(self.HI * n), 160):
             if (c[s0 + w] - c[s0]) / w > thr:
                 continue
             cut = s0 + w // 2
-            t = max(1.08 * gpu_ms(cut / RATE), 1.1 * (10 + 45 * (n - cut) / RATE)) + 15
+            t = max(1.09 * gpu_ms(cut / RATE), 34.0 * (n - cut) / RATE + 8.0) + 10.0
             if best is None or t < best[0]:
                 best = (t, cut)
         if best is None or best[0] > 0.9 * gpu_ms(n / RATE):
@@ -667,7 +669,7 @@ def main():
         model_label = "oido streaming GPU" + (" (incremental, GPU front end)" if incr and gpu_front else
                                               " (incremental, CPU front end)" if incr else "")
     elif args.gpu_full:
-        model_label = "oido full GPU (nemo8)"
+        model_label = "oido hybrid GPU+CPU (nemo8, 11-20)" if whistle.hybrid is not None else "oido full GPU (nemo8)"
     elif args.gpu_encoder:
         model_label = "oido GPU encoder (CPU front end)"
     else:
