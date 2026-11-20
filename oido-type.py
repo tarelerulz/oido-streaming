@@ -136,12 +136,104 @@ def tts_playing():
     return now - _tts_last_busy < TTS_TAIL
 
 
+class HybridTail:
+    """2026-11-19 EXPERIMENT (OIDO_HYBRID=1): long phrases are cut at their quietest moment near 60 %; the GPU transcribes the head
+    while a resident CPU engine (tasr_cli_a72 --serve, nice 19, cores 1-3) transcribes the tail at the same time. Test: 10 s clip
+    488 -> 390 ms, 15 s 817 -> 501 ms, same text (~/doc/agent-memory/2026-11-19-hybrid-chunk-split.md). Any failure -> full GPU."""
+    MIN_S = float(os.environ.get("OIDO_HYBRID_MIN", "4.5"))   # phrases shorter than this stay GPU-only
+    def __init__(self, use_lm=False):
+        self.use_lm, self.p, self.lock = use_lm, None, threading.Lock()
+        self.dead = False
+        threading.Thread(target=self._start, daemon=True).start()   # load the model while the first phrase is spoken
+
+    @staticmethod
+    def configure_gpu():
+        """A performance governor already holds the clock up; don't burn a CPU core doing it."""
+        if "GPUPORT_SPIN" in os.environ:
+            return  # preserve an explicit A/B override
+        try:
+            policies = list(Path("/sys/devices/system/cpu/cpufreq").glob("policy*/scaling_governor"))
+            if policies and all(p.read_text().strip() == "performance" for p in policies):
+                os.environ["GPUPORT_SPIN"] = "0"
+                log("hybrid: performance governor; GPU keep-awake spinner disabled")
+        except OSError:
+            pass  # unknown governor: retain the runner's existing default
+
+    def _start(self):
+        try:
+            cmd = ["nice", "-n", "19", "taskset", "-c", "1,2,3", str(OIDO_CLI), str(OIDO_MODEL)]
+            if self.use_lm:
+                cmd += ["--lm", str(OIDO_LM)]
+            cmd += ["--serve"]
+            env = {**os.environ, "TASR_THREADS": "3", "OMP_NUM_THREADS": "3"}
+            self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env)
+            log("hybrid: resident CPU engine started")
+        except Exception as e:
+            self.dead = True
+            log(f"hybrid: CPU engine failed to start, GPU only: {e}")
+
+    # 2026-11-19 cut rule (~/doc/benchmarks/hybrid-chunk-split-2026-11-19/cutrule.py, tested on 65 real clips): only cut at a real pause
+    # (100 ms energy <= RATIO x the phrase's speech level), pick the pause that balances GPU head and CPU tail by estimated time,
+    # skip the split when the estimated gain is under 10 %.
+    RATIO = float(os.environ.get("OIDO_HYBRID_RATIO", "0.05"))
+    GPU_PTS = [(0, 60), (1.5, 125), (2.4, 148), (3.1, 204), (3.7, 228), (4.5, 250), (5.8, 348), (7.0, 387), (9.4, 476), (10, 488), (15, 817), (19, 1127)]
+
+    def split(self, pcm):
+        """Cut index (samples) or None."""
+        n = len(pcm)
+        if self.dead or self.p is None or self.p.poll() is not None or n < int(self.MIN_S * RATE):
+            return None
+        xs, ys = [p[0] for p in self.GPU_PTS], [p[1] for p in self.GPU_PTS]
+        gpu_ms = lambda sec: float(np.interp(sec, xs, ys))
+        a = np.abs(pcm.astype(np.float32)); c = np.concatenate([[0.0], np.cumsum(a)]); w = RATE // 10
+        st = np.arange(0, n - w, 160); e_all = (c[st + w] - c[st]) / w
+        thr = max(30.0, self.RATIO * float(np.percentile(e_all, 70)))
+        best = None
+        for s0 in range(int(0.35 * n), int(0.75 * n), 160):
+            if (c[s0 + w] - c[s0]) / w > thr:
+                continue
+            cut = s0 + w // 2
+            t = max(1.08 * gpu_ms(cut / RATE), 1.1 * (10 + 45 * (n - cut) / RATE)) + 15
+            if best is None or t < best[0]:
+                best = (t, cut)
+        if best is None or best[0] > 0.9 * gpu_ms(n / RATE):
+            return None
+        return int(best[1])
+
+    def tail(self, pcm_tail):
+        """Text of the tail via the CPU engine, or None on any problem (caller then redoes the phrase on the GPU)."""
+        with self.lock:
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", dir="/dev/shm") as f:
+                    with wave.open(f.name, "wb") as w:
+                        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+                        w.writeframes(pcm_tail.tobytes())
+                    self.p.stdin.write(f.name + "\n"); self.p.stdin.flush()
+                    out = {}
+                    def rd():
+                        out["l"] = self.p.stdout.readline()
+                    th = threading.Thread(target=rd, daemon=True); th.start(); th.join(5.0)
+                    if th.is_alive() or not out.get("l"):
+                        raise RuntimeError("CPU engine did not answer")
+                    return out["l"].rstrip("\n").split("\t")[-1].strip()
+            except Exception as e:
+                log(f"hybrid: CPU tail failed ({e}); disabled, GPU only")
+                self.dead = True
+                try:
+                    self.p.kill()
+                except Exception:
+                    pass
+                return None
+
+
 class OidoCLI:
     """One phrase -> text with the Oido CLI (nemo8 + LM), then punctuation from the keep-loaded punct server.
     If the server is not running, the punctuation model is loaded here once (as in voice-type.py).
     gpu=True: the encoder runs on the GPU (gpu_encoder.py, resident server); the CPU does features and decoding."""
     def __init__(self, gpu=False, gpu_full=False, gpu_stream=False):
         self.gpu = None
+        if gpu_full and os.environ.get("OIDO_HYBRID") == "1":
+            HybridTail.configure_gpu()  # before spawning the GPU runner
         if gpu_stream:   # streaming model, whole front end + 16 blocks on the GPU in 16-frame chunks (stream_gpu2.py)
             sys.path.insert(0, str(OIDO_GPU_DIR))
             import stream_gpu2
@@ -159,6 +251,10 @@ class OidoCLI:
                 import gpu_encoder
                 self.gpu = gpu_encoder.GpuEncoder().start()
                 log("oido GPU encoder: server started")
+        self.hybrid = None
+        if gpu_full and os.environ.get("OIDO_HYBRID") == "1":
+            self.hybrid = HybridTail(use_lm=bool(os.environ.get("GPUPORT_LM")))
+            log(f"hybrid CPU+GPU split on for phrases >= {HybridTail.MIN_S:.1f} s (cut only at real pauses)")
         spec = importlib.util.spec_from_file_location("oido_punct", str(OIDO_PUNCT))
         self.punct_mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.punct_mod)
@@ -178,7 +274,20 @@ class OidoCLI:
         if self.gpu is not None:
             pcm = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
             try:
-                text = self.gpu.transcribe(pcm).strip()
+                text = None
+                cut = self.hybrid.split(pcm) if self.hybrid is not None else None
+                if cut is not None:
+                    res = {}
+                    th = threading.Thread(target=lambda: res.setdefault("t", self.hybrid.tail(pcm[cut:])), daemon=True)
+                    t0 = time.time(); th.start()
+                    head = self.gpu.transcribe(pcm[:cut]).strip()
+                    th.join(6.0)
+                    tail = res.get("t")
+                    if tail is not None:
+                        text = (head + " " + tail).strip()
+                        log(f"hybrid: head {cut / RATE:.1f} s on GPU + tail {(len(pcm) - cut) / RATE:.1f} s on CPU, {time.time() - t0:.2f} s")
+                if text is None:
+                    text = self.gpu.transcribe(pcm).strip()
             except Exception as e:  # GPU server trouble: fall back to the CPU path for this phrase
                 log(f"oido GPU failed, CPU for this phrase: {e}")
                 text = None
