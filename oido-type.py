@@ -69,6 +69,25 @@ def split_stop(spoken):
 # if it is >= KWS_STOP sure, dictation stops even when Whistle misheard the words. Off: WHISTLE_KWS_STOP=off.
 KWS_STOP = float(os.environ.get("WHISTLE_KWS_STOP_SURE", "0.7"))
 _kws = None
+_kws_lock = threading.Lock()
+KWS_EARLY = os.environ.get("OIDO_KWS_EARLY", "0").lower() in ("1", "on", "yes")   # 2026-11-23: run the stop-word check right after the early text, not after the phrase end
+
+
+def kws_async(samples):
+    """Start kws_says_stop(samples) in a thread; the caller waits on box["done"] later. Used with OIDO_KWS_EARLY=1: the check
+    (~123 ms on the GPU, phrases <= 3000 ms only) then runs while the phrase-end timer is still counting."""
+    box = {"v": None, "done": threading.Event()}
+
+    def work():
+        try:
+            with _kws_lock:
+                box["v"] = kws_says_stop(samples)
+        except Exception as e:
+            log(f"early stop-word check failed: {e}")
+        finally:
+            box["done"].set()
+    threading.Thread(target=work, daemon=True).start()
+    return box
 
 
 def kws_says_stop(samples):
@@ -474,7 +493,7 @@ class KeptWhistle:
 
 RATE = 16000
 CHUNK = 1280
-MIN_SILENCE = 0.6                # seconds of quiet that end a phrase
+MIN_SILENCE = float(os.environ.get("OIDO_SILENCE_MS", "600")) / 1000   # seconds of quiet that end a phrase (2026-11-23: OIDO_SILENCE_MS=500 / 400 saves ~130 / ~250 ms per phrase, see BENCHMARKS.md)
 PRE_ROLL = 5.0                   # 2026-11-09: seconds of audio fed to the GPU stream before the VAD detection
 EARLY = 0.25                     # start transcribing after this much quiet; type only after MIN_SILENCE
 # Phrase clips (2026-10-07, Tarel: keep them so fixes can be tested on real mistakes). Each typed phrase's audio
@@ -829,6 +848,7 @@ def main():
     # if the phrase turned out longer (you kept talking), it is transcribed again. Same phrase cuts as without it.
     # (A single VAD with a typing timer typed too soon: speech restart is noticed ~0.2 s late -> "to... Create".)
     ready = None                        # (start, end, text) from the quick VAD
+    early_kws = None                    # stop-word check started with the early text (OIDO_KWS_EARLY=1)
     sess = None                         # --incr: the open GPU stream session for this phrase
     pad_a, pad_b = int(PAD_BEFORE * RATE), int(PAD_AFTER * RATE)
     p_start = None                      # start of the phrase the normal VAD is still in
@@ -897,10 +917,12 @@ def main():
                     live.paused = True                # quiet: no streaming pass while the early text runs
                     live.wait_idle()
                 ready = (p_start, start + n, run(p_start, start + n, "early"))
+                early_kws = kws_async(cut(p_start, start + n)) if KWS_EARLY else None
         while not vad.empty():
             start, n = vad.front.start, len(vad.front.samples)
             vad.pop()
             listening = False
+            kws_box = None
             last_end = seen
             if live is not None:
                 live.end()
@@ -909,6 +931,7 @@ def main():
             if ready and abs(ready[1] - end) < RATE // 4 and abs(ready[0] - start) < RATE // 4:
                 raw, span, why = ready[2], (ready[0], ready[1]), "early"   # early text covers this phrase
                 log("used early text")
+                kws_box = early_kws
             else:
                 if live is not None:
                     live.wait_idle()
@@ -924,7 +947,13 @@ def main():
                 if raw is None:
                     raw, span, why = run(start, end, "full"), (start, end), "full"
             ready, p_start = None, None
-            p_stop = kws_says_stop(cut(*span))
+            if why == "early" and kws_box is not None:      # same samples as the early text: the check already ran (or is running)
+                kws_box["done"].wait(5)
+                p_stop = kws_box["v"]
+                log("stop-word check was done early")
+            else:
+                p_stop = kws_says_stop(cut(*span))
+            early_kws = None
             if p_stop is not None:
                 log(f"model p(stop) {p_stop:.2f}")
             if p_stop is not None and p_stop >= KWS_STOP and not split_stop(re.sub(r"[^\w\s]", "", raw.lower()).strip())[1]:
