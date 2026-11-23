@@ -144,6 +144,10 @@ class HybridTail:
     def __init__(self, use_lm=False):
         self.use_lm, self.p, self.lock = use_lm, None, threading.Lock()
         self.dead = False
+        if self.RULE not in CUT_RULES:
+            log(f"hybrid: unknown cut rule '{self.RULE}', using 'live' (known: {', '.join(sorted(CUT_RULES))})")
+        else:
+            log(f"hybrid: cut rule '{self.RULE}'")
         threading.Thread(target=self._start, daemon=True).start()   # load the model while the first phrase is spoken
 
     @staticmethod
@@ -180,27 +184,22 @@ class HybridTail:
     HI = float(os.environ.get("OIDO_HYBRID_HI", "0.70"))
     GPU_PTS = [(0, 95), (2.56, 128), (2.57, 180), (5.12, 238), (5.13, 295), (7.68, 385), (7.69, 420), (10.24, 460), (10.25, 535), (15, 775), (19, 1080)]
 
+    # Fresh GPU time curve measured 2026-11-22 (about 30 % slower than GPU_PTS above); used by the "balance"/"snap" rules only.
+    GPU_PTS_NOW = [(0, 95), (1, 103), (2.5, 136), (4, 225), (5.5, 305), (7, 363), (8.5, 444), (10, 470), (11.5, 614), (13, 746),
+                   (14.5, 802), (16, 963), (17.5, 984), (19, 1080)]
+    RULE = os.environ.get("OIDO_HYBRID_RULE", "live")   # which entry of CUT_RULES (below) picks the cut
+
     def split(self, pcm):
-        """Cut index (samples) or None."""
+        """Cut index (samples) or None. The choice of cut is made by the rule named in OIDO_HYBRID_RULE (see CUT_RULES)."""
         n = len(pcm)
         if self.dead or self.p is None or self.p.poll() is not None or n < int(self.MIN_S * RATE):
             return None
-        xs, ys = [p[0] for p in self.GPU_PTS], [p[1] for p in self.GPU_PTS]
-        gpu_ms = lambda sec: float(np.interp(sec, xs, ys))
-        a = np.abs(pcm.astype(np.float32)); c = np.concatenate([[0.0], np.cumsum(a)]); w = RATE // 10
-        st = np.arange(0, n - w, 160); e_all = (c[st + w] - c[st]) / w
-        thr = max(30.0, self.RATIO * float(np.percentile(e_all, 70)))
-        best = None
-        for s0 in range(int(self.LO * n), int(self.HI * n), 160):
-            if (c[s0 + w] - c[s0]) / w > thr:
-                continue
-            cut = s0 + w // 2
-            t = max(1.09 * gpu_ms(cut / RATE), 33.0 * (n - cut) / RATE + 4.0) + 10.0
-            if best is None or t < best[0]:
-                best = (t, cut)
-        if best is None or best[0] > 0.9 * gpu_ms(n / RATE):
+        try:
+            cut = (CUT_RULES.get(self.RULE) or CUT_RULES["live"])(self, pcm)
+        except Exception as e:   # a broken rule must never break dictation: no split = whole phrase on the GPU
+            log(f"hybrid: cut rule '{self.RULE}' failed ({e}); GPU only for this phrase")
             return None
-        return int(best[1])
+        return int(cut) if cut is not None and 0 < cut < n else None
 
     def tail(self, pcm_tail):
         """Text of the tail via the CPU engine, or None on any problem (caller then redoes the phrase on the GPU)."""
@@ -226,6 +225,89 @@ class HybridTail:
                 except Exception:
                     pass
                 return None
+
+
+# ===================== HYBRID CUT RULES (2026-11-22) =====================
+# A rule is a function  fn(ht, pcm) -> cut sample index, or None (= no split, the whole phrase goes to the GPU).
+#   ht  = the HybridTail (its GPU_PTS, GPU_PTS_NOW, RATIO, LO, HI settings are available)
+#   pcm = int16 numpy array of the phrase (already at least OIDO_HYBRID_MIN seconds long)
+# ADD a rule:    write a function below with @cut_rule("name"), then run with OIDO_HYBRID_RULE=name.
+# REMOVE a rule: delete its function (an unknown name falls back to "live"). "live" must stay: it is the fallback.
+# A rule that raises just means no split for that phrase.
+# Measured 2026-11-22 on 72 TTS clips with known text (word error rate; CPU-only 10.7 %, GPU-only 11.3 %): live 13.2 %,
+# balance 15.9 %, snap 13.2 %; mean wall ms CPU-only 336, live 293, balance 319, snap 320. Details and caveats:
+# ~/doc/agent-memory/2026-11-22-oido-cpu-gpu-hybrid-bench-rerun.md. Test script: ~/doc/benchmarks/oido-bench7-wer-cut-rules.py
+CUT_RULES = {}
+
+def cut_rule(name):
+    def reg(fn):
+        CUT_RULES[name] = fn
+        return fn
+    return reg
+
+def _cpu_tail_ms(sec):
+    """Model of the resident 3-thread CPU engine: ~33 ms per second of audio + 4 ms."""
+    return 33.0 * sec + 4.0
+
+def _gpu_ms(pts, sec):
+    return float(np.interp(sec, [p[0] for p in pts], [p[1] for p in pts]))
+
+def _cumabs(pcm):
+    """Running sum of |sample| so any 100 ms window's mean level is (c[s+w]-c[s])/w."""
+    return np.concatenate([[0.0], np.cumsum(np.abs(pcm.astype(np.float32)))]), RATE // 10
+
+@cut_rule("off")
+def _rule_off(ht, pcm):
+    return None   # never split (the hybrid engine stays loaded but unused)
+
+@cut_rule("live")
+def _rule_live(ht, pcm):
+    """The rule in use since 2026-11-20: quietest moments between LO and HI of the phrase (below a quiet threshold),
+    cut chosen by the old GPU curve and the CPU model; no split unless it is expected to save >10 %."""
+    n = len(pcm); c, w = _cumabs(pcm)
+    st = np.arange(0, n - w, 160); e_all = (c[st + w] - c[st]) / w
+    thr = max(30.0, ht.RATIO * float(np.percentile(e_all, 70)))
+    best = None
+    for s0 in range(int(ht.LO * n), int(ht.HI * n), 160):
+        if (c[s0 + w] - c[s0]) / w > thr:
+            continue
+        cut = s0 + w // 2
+        t = max(1.09 * _gpu_ms(ht.GPU_PTS, cut / RATE), _cpu_tail_ms((n - cut) / RATE)) + 10.0
+        if best is None or t < best[0]:
+            best = (t, cut)
+    if best is None or best[0] > 0.9 * _gpu_ms(ht.GPU_PTS, n / RATE):
+        return None
+    return int(best[1])
+
+def _balance_cut(ht, n):
+    """Sample where GPU head time and CPU tail time are closest, between 15 % and 85 % of the phrase (ignores sound)."""
+    best = None
+    for cut in range(int(0.15 * n), int(0.85 * n), 160):
+        t = max(_gpu_ms(ht.GPU_PTS_NOW, cut / RATE), _cpu_tail_ms((n - cut) / RATE))
+        if best is None or t < best[0]:
+            best = (t, cut)
+    return best[1]
+
+@cut_rule("balance")
+def _rule_balance(ht, pcm):
+    """Fastest but cuts mid-speech: balance point of the fresh curves, anywhere. Measured WER 15.9 % (live 13.2 %)."""
+    return _balance_cut(ht, len(pcm))
+
+@cut_rule("snap")
+def _rule_snap(ht, pcm):
+    """Balance point, then moved to the quietest 100 ms within +-OIDO_HYBRID_SNAP_S seconds (default 0.5)."""
+    n = len(pcm); c, w = _cumabs(pcm)
+    cb = _balance_cut(ht, n); rad = int(float(os.environ.get("OIDO_HYBRID_SNAP_S", "0.5")) * RATE)
+    best = None
+    for s0 in range(max(int(0.15 * n), cb - rad), min(int(0.85 * n), cb + rad), 160):
+        if s0 + w >= n:
+            break
+        e = (c[s0 + w] - c[s0]) / w
+        if best is None or e < best[0]:
+            best = (e, s0 + w // 2)
+    return None if best is None else best[1]
+
+# ===================== end of cut rules =====================
 
 
 class OidoCLI:

@@ -20,3 +20,11 @@ cores 1-3 transcribes the tail; any CPU-side problem falls back to the GPU for t
 488 -> 390 ms, 15 s 817 -> 501 ms, same text. The real gain in live dictation is small (early transcription already hides most of
 the wait) and word quality in daily use is not judged yet. A standalone, tested version of the class and the thread-pool fix it
 needs are in a draft pull request on the oido repo (tarelerulz/oido #16).
+
+Sync 2026-11-22 (oido-type.py): the hybrid cut is now chosen by a pluggable rule, `OIDO_HYBRID_RULE=live|snap|balance|off` (default
+`live`, identical to the previous behaviour). Add a rule with one `@cut_rule("name")` function in the "HYBRID CUT RULES" block, remove
+it by deleting the function; an unknown name falls back to `live` and a rule that raises just means no split. Measured on a Pi 400
+with 72 synthetic-speech clips of known text (word error rate over 1883 words): CPU-only 10.7 %, GPU-only 11.3 %, `live` 13.2 %,
+`snap` 13.2 %, `balance` 15.9 %; mean wall time 336 / 579 / 293 / 320 / 319 ms. So every hybrid rule costs words versus CPU-only, and
+`balance` (fastest at long clips, cuts mid-speech) costs the most. One synthetic voice, one run, no significance test; real voices not
+tested. `live` must stay (it is the fallback).
