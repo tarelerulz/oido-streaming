@@ -28,3 +28,13 @@ with 72 synthetic-speech clips of known text (word error rate over 1883 words): 
 `snap` 13.2 %, `balance` 15.9 %; mean wall time 336 / 579 / 293 / 320 / 319 ms. So every hybrid rule costs words versus CPU-only, and
 `balance` (fastest at long clips, cuts mid-speech) costs the most. One synthetic voice, one run, no significance test; real voices not
 tested. `live` must stay (it is the fallback).
+
+Sync 2026-11-23 (oido-type.py): two opt-in latency settings, both off by default (behaviour unchanged unless set).
+`OIDO_SILENCE_MS` is the quiet that ends a phrase (default 600). `OIDO_KWS_EARLY=1` runs the stop-word check (only on phrases of
+3,000 ms or less, about 123 ms on the GPU) right after the early text, in a thread, instead of after the phrase end.
+Measured on a Pi 400 by replaying 62 recorded phrases (4,500 ms or longer) through the live voice-detector settings with the CPU engine
+(language model, 4 threads), time from the end of speech until the text would be typed, mean: 718 ms at 600 ms, 590 ms at 500 ms,
+480 ms at 400 ms. Word errors on 25 hand-labelled phrases (364 words, CPU engine, offline voice-detector cut): 28 / 29 / 32 at 600 / 500 /
+400 ms. The stop-word check was not included in those timings; it adds about 123 ms to phrases of 3,000 ms or less (half of the
+recorded phrases) unless `OIDO_KWS_EARLY=1`. Replay with digital silence appended, small sample, not tried on a live microphone.
+Test: a recorded clip through `--wav` into a scratch tmux pane gave the same stop-word result with the setting off and on.
